@@ -9,14 +9,16 @@ import {
 } from '@/services/alertEngine'
 import { notifySystem, playAlertTone } from '@/composables/useNotifications'
 import { sanitizeMotdHtml } from '@/utils/sanitizeMotd'
+import { getNextCronOccurrence } from '@/utils/cron'
+import {
+  getSlotTs,
+  normalizeHistory,
+  type Snapshot,
+  type SnapshotSource,
+  upsertHistorySnapshot,
+} from '@/utils/history'
 
 export type ServerAddress = string
-
-export type Snapshot = {
-  ts: number
-  state: ServerState
-  online: number | null
-}
 
 export type ServerRuntime = {
   address: ServerAddress
@@ -33,7 +35,7 @@ export type ServerRuntime = {
 
 const STORAGE_SERVERS = 'mcwatcher.servers'
 const STORAGE_SETTINGS = 'mcwatcher.settings'
-const POLL_INTERVAL_MS = 10 * 60 * 1000
+const STORAGE_HISTORY = 'mcwatcher.history'
 
 const defaultSettings: AlertSettings = {
   whitelistMode: true,
@@ -42,13 +44,33 @@ const defaultSettings: AlertSettings = {
   countAlertEnabled: false,
   countAlertMode: 'any_increase',
   countThreshold: 5,
-  chartHours: 12,
+  chartSegmentMinutes: 10,
+  chartVisibleSegments: 35,
+  historyStorageLimit: 1000,
+  curveColorMode: 'latest_state',
+  showStatusTrack: true,
+  refreshCron: '*/10 * * * *',
   soundEnabled: true,
   systemNotifyEnabled: true,
 }
 
 function normalizeAddress(address: string) {
   return address.trim().toLowerCase()
+}
+
+function ensureRuntime(address: string): ServerRuntime {
+  return {
+    address,
+    faviconUrl: getFaviconUrl(address),
+    motdHtmlSafe: '',
+    motdText: '',
+    state: 'offline',
+    online: null,
+    max: null,
+    playersDataValid: false,
+    players: [],
+    history: [],
+  }
 }
 
 function sanitizeRules(input: unknown): PlayerRuleItem[] {
@@ -80,18 +102,52 @@ function sanitizeRules(input: unknown): PlayerRuleItem[] {
   return rules
 }
 
-function ensureRuntime(address: string): ServerRuntime {
+function normalizeSettings(raw: Partial<AlertSettings> & { chartHours?: number }): AlertSettings {
+  const segmentMinutes =
+    typeof raw.chartSegmentMinutes === 'number'
+      ? Math.max(1, Math.floor(raw.chartSegmentMinutes))
+      : 10
+
+  const migratedVisibleSegments =
+    typeof raw.chartVisibleSegments === 'number'
+      ? Math.floor(raw.chartVisibleSegments)
+      : typeof raw.chartHours === 'number'
+        ? Math.floor((raw.chartHours * 60) / segmentMinutes)
+        : 35
+
   return {
-    address,
-    faviconUrl: getFaviconUrl(address),
-    motdHtmlSafe: '',
-    motdText: '',
-    state: 'offline',
-    online: null,
-    max: null,
-    playersDataValid: false,
-    players: [],
-    history: [],
+    whitelistMode:
+      typeof raw.whitelistMode === 'boolean' ? raw.whitelistMode : defaultSettings.whitelistMode,
+    whitelist: sanitizeRules(raw.whitelist),
+    blacklist: sanitizeRules(raw.blacklist),
+    countAlertEnabled:
+      typeof raw.countAlertEnabled === 'boolean'
+        ? raw.countAlertEnabled
+        : defaultSettings.countAlertEnabled,
+    countAlertMode: raw.countAlertMode === 'threshold' ? 'threshold' : 'any_increase',
+    countThreshold:
+      typeof raw.countThreshold === 'number'
+        ? Math.max(1, Math.floor(raw.countThreshold))
+        : defaultSettings.countThreshold,
+    chartSegmentMinutes: segmentMinutes,
+    chartVisibleSegments: Math.max(1, Math.min(35, migratedVisibleSegments)),
+    historyStorageLimit:
+      typeof raw.historyStorageLimit === 'number'
+        ? Math.max(50, Math.floor(raw.historyStorageLimit))
+        : defaultSettings.historyStorageLimit,
+    curveColorMode: raw.curveColorMode === 'per_segment' ? 'per_segment' : 'latest_state',
+    showStatusTrack:
+      typeof raw.showStatusTrack === 'boolean' ? raw.showStatusTrack : defaultSettings.showStatusTrack,
+    refreshCron:
+      typeof raw.refreshCron === 'string' && raw.refreshCron.trim()
+        ? raw.refreshCron.trim()
+        : defaultSettings.refreshCron,
+    soundEnabled:
+      typeof raw.soundEnabled === 'boolean' ? raw.soundEnabled : defaultSettings.soundEnabled,
+    systemNotifyEnabled:
+      typeof raw.systemNotifyEnabled === 'boolean'
+        ? raw.systemNotifyEnabled
+        : defaultSettings.systemNotifyEnabled,
   }
 }
 
@@ -107,7 +163,9 @@ export const useWatcherStore = defineStore('watcher', () => {
 
   const isRefreshing = ref(false)
   const lastRefreshAt = ref<number | null>(null)
-  let pollTimer: ReturnType<typeof setInterval> | null = null
+  const nextRefreshAt = ref<number | null>(null)
+  let pollTimer: ReturnType<typeof setTimeout> | null = null
+  const pollingEnabled = ref(false)
 
   const serverRows = computed(() =>
     servers.value.map((address) => {
@@ -134,47 +192,61 @@ export const useWatcherStore = defineStore('watcher', () => {
     try {
       const rawSettings = localStorage.getItem(STORAGE_SETTINGS)
       if (rawSettings) {
-        const parsed = JSON.parse(rawSettings) as Partial<AlertSettings>
-        settings.value = {
-          whitelistMode:
-            typeof parsed.whitelistMode === 'boolean'
-              ? parsed.whitelistMode
-              : defaultSettings.whitelistMode,
-          whitelist: sanitizeRules(parsed.whitelist),
-          blacklist: sanitizeRules(parsed.blacklist),
-          countAlertEnabled:
-            typeof parsed.countAlertEnabled === 'boolean'
-              ? parsed.countAlertEnabled
-              : defaultSettings.countAlertEnabled,
-          countAlertMode:
-            parsed.countAlertMode === 'threshold' ? 'threshold' : defaultSettings.countAlertMode,
-          countThreshold:
-            typeof parsed.countThreshold === 'number'
-              ? Math.max(1, Math.floor(parsed.countThreshold))
-              : defaultSettings.countThreshold,
-          chartHours:
-            typeof parsed.chartHours === 'number'
-              ? Math.min(168, Math.max(1, Math.floor(parsed.chartHours)))
-              : defaultSettings.chartHours,
-          soundEnabled:
-            typeof parsed.soundEnabled === 'boolean'
-              ? parsed.soundEnabled
-              : defaultSettings.soundEnabled,
-          systemNotifyEnabled:
-            typeof parsed.systemNotifyEnabled === 'boolean'
-              ? parsed.systemNotifyEnabled
-              : defaultSettings.systemNotifyEnabled,
-        }
+        settings.value = normalizeSettings(JSON.parse(rawSettings) as Partial<AlertSettings> & { chartHours?: number })
       }
     } catch {
       settings.value = { ...defaultSettings }
     }
 
+    const historyMap = loadHistoryMap()
     for (const address of servers.value) {
-      runtimes[address] = ensureRuntime(address)
+      const runtime = ensureRuntime(address)
+      runtime.history = normalizeHistory(historyMap[address] ?? [], settings.value.historyStorageLimit)
+      runtimes[address] = runtime
       serverInitialized[address] = false
       lastSeenPlayersByServer[address] = []
       lastOnlineCountByServer[address] = null
+    }
+  }
+
+  function loadHistoryMap() {
+    try {
+      const raw = localStorage.getItem(STORAGE_HISTORY)
+      if (!raw) {
+        return {} as Record<ServerAddress, Snapshot[]>
+      }
+      const parsed = JSON.parse(raw) as Record<ServerAddress, unknown>
+      const result: Record<ServerAddress, Snapshot[]> = {}
+      for (const [address, value] of Object.entries(parsed)) {
+        if (!Array.isArray(value)) {
+          continue
+        }
+        const normalized: Snapshot[] = []
+        for (const entry of value) {
+          if (!entry || typeof entry !== 'object') {
+            continue
+          }
+          const point = entry as Partial<Snapshot>
+          if (typeof point.ts !== 'number' || typeof point.slotTs !== 'number') {
+            continue
+          }
+          normalized.push({
+            ts: point.ts,
+            slotTs: point.slotTs,
+            state:
+              point.state === 'online' || point.state === 'offline' || point.state === 'api_error'
+                ? point.state
+                : 'api_error',
+            online: typeof point.online === 'number' ? point.online : null,
+            source: point.source === 'manual' ? 'manual' : 'auto',
+            isDraft: Boolean(point.isDraft),
+          })
+        }
+        result[address] = normalized
+      }
+      return result
+    } catch {
+      return {} as Record<ServerAddress, Snapshot[]>
     }
   }
 
@@ -186,9 +258,16 @@ export const useWatcherStore = defineStore('watcher', () => {
     localStorage.setItem(STORAGE_SETTINGS, JSON.stringify(settings.value))
   }
 
-  function trimHistory(history: Snapshot[]) {
-    const minTs = Date.now() - settings.value.chartHours * 60 * 60 * 1000
-    return history.filter((entry) => entry.ts >= minTs)
+  function persistHistory() {
+    const historyMap: Record<ServerAddress, Snapshot[]> = {}
+    for (const address of servers.value) {
+      const runtime = runtimes[address]
+      if (!runtime) {
+        continue
+      }
+      historyMap[address] = normalizeHistory(runtime.history, settings.value.historyStorageLimit)
+    }
+    localStorage.setItem(STORAGE_HISTORY, JSON.stringify(historyMap))
   }
 
   function addServer(rawAddress: string) {
@@ -201,6 +280,7 @@ export const useWatcherStore = defineStore('watcher', () => {
     serverInitialized[address] = false
     lastSeenPlayersByServer[address] = []
     lastOnlineCountByServer[address] = null
+    persistHistory()
     return true
   }
 
@@ -210,9 +290,51 @@ export const useWatcherStore = defineStore('watcher', () => {
     delete serverInitialized[address]
     delete lastSeenPlayersByServer[address]
     delete lastOnlineCountByServer[address]
+    persistHistory()
   }
 
-  async function refreshServer(address: string, canAlert: boolean) {
+  function appendSnapshot(
+    address: string,
+    source: SnapshotSource,
+    state: ServerState,
+    online: number | null,
+    now: number,
+  ) {
+    const runtime = runtimes[address] ?? ensureRuntime(address)
+    const slotTs = getSlotTs(now, settings.value.chartSegmentMinutes)
+    const snapshot: Snapshot = {
+      ts: now,
+      slotTs,
+      state,
+      online,
+      source,
+      isDraft: source === 'manual',
+    }
+    runtime.history = upsertHistorySnapshot(
+      runtime.history,
+      snapshot,
+      source,
+      settings.value.historyStorageLimit,
+    )
+    runtimes[address] = runtime
+  }
+
+  function resegmentAllHistories() {
+    for (const address of servers.value) {
+      const runtime = runtimes[address]
+      if (!runtime) {
+        continue
+      }
+      const mapped = runtime.history.map((point) => ({
+        ...point,
+        slotTs: getSlotTs(point.ts, settings.value.chartSegmentMinutes),
+      }))
+      runtime.history = normalizeHistory(mapped, settings.value.historyStorageLimit)
+    }
+    persistHistory()
+  }
+
+  async function refreshServer(address: string, canAlert: boolean, source: SnapshotSource) {
     const result = await fetchServerStatus(address)
     const runtime = runtimes[address] ?? ensureRuntime(address)
     const now = Date.now()
@@ -224,14 +346,9 @@ export const useWatcherStore = defineStore('watcher', () => {
     runtime.players = result.players
     runtime.motdText = result.motdClean
     runtime.motdHtmlSafe = sanitizeMotdHtml(result.motdHtml, result.motdClean)
-    runtime.history = trimHistory(
-      runtime.history.concat({
-        ts: now,
-        state: result.state,
-        online: result.online,
-      }),
-    )
     runtimes[address] = runtime
+
+    appendSnapshot(address, source, result.state, result.online, now)
 
     const previousPlayers = new Set(lastSeenPlayersByServer[address] ?? [])
     const currentPlayers = new Set(result.playersDataValid ? result.players : [])
@@ -288,7 +405,7 @@ export const useWatcherStore = defineStore('watcher', () => {
     }
   }
 
-  async function refreshAll() {
+  async function refreshAll(source: SnapshotSource = 'auto') {
     if (isRefreshing.value) {
       return
     }
@@ -300,7 +417,7 @@ export const useWatcherStore = defineStore('watcher', () => {
     try {
       for (const address of servers.value) {
         const canAlert = globalReady && !!serverInitialized[address]
-        const result = await refreshServer(address, canAlert)
+        const result = await refreshServer(address, canAlert, source)
 
         for (const player of result.playerJoinEvents) {
           if (!playerAlertMap.has(player)) {
@@ -309,7 +426,12 @@ export const useWatcherStore = defineStore('watcher', () => {
           playerAlertMap.get(player)?.add(address)
         }
 
-        if (canAlert && result.countIncreased && result.previousOnline !== null && result.currentOnline !== null) {
+        if (
+          canAlert &&
+          result.countIncreased &&
+          result.previousOnline !== null &&
+          result.currentOnline !== null
+        ) {
           countAlerts.push({
             address,
             from: result.previousOnline,
@@ -323,28 +445,63 @@ export const useWatcherStore = defineStore('watcher', () => {
       } else {
         initializedGlobal.value = true
       }
+
+      persistHistory()
       lastRefreshAt.value = Date.now()
     } finally {
       isRefreshing.value = false
     }
   }
 
-  function startPolling() {
-    if (pollTimer) {
-      clearInterval(pollTimer)
-    }
-    void refreshAll()
-    pollTimer = setInterval(() => {
-      void refreshAll()
-    }, POLL_INTERVAL_MS)
-  }
-
-  function stopPolling() {
+  function clearPollTimer() {
     if (!pollTimer) {
       return
     }
-    clearInterval(pollTimer)
+    clearTimeout(pollTimer)
     pollTimer = null
+  }
+
+  function scheduleNextAutoRefresh() {
+    clearPollTimer()
+    if (!pollingEnabled.value) {
+      nextRefreshAt.value = null
+      return
+    }
+    const now = new Date()
+    let delay = 10 * 60 * 1000
+    let targetTs = now.getTime() + delay
+    try {
+      const next = getNextCronOccurrence(settings.value.refreshCron, now)
+      if (next) {
+        delay = Math.max(1, next.getTime() - now.getTime())
+        targetTs = next.getTime()
+      }
+    } catch {
+      delay = 10 * 60 * 1000
+      targetTs = now.getTime() + delay
+    }
+    nextRefreshAt.value = targetTs
+
+    pollTimer = setTimeout(async () => {
+      await refreshAll('auto')
+      scheduleNextAutoRefresh()
+    }, delay)
+  }
+
+  function startPolling() {
+    pollingEnabled.value = true
+    void refreshAll('auto')
+    scheduleNextAutoRefresh()
+  }
+
+  function stopPolling() {
+    pollingEnabled.value = false
+    clearPollTimer()
+    nextRefreshAt.value = null
+  }
+
+  function updateSettings(next: AlertSettings) {
+    settings.value = normalizeSettings(next)
   }
 
   watch(
@@ -354,12 +511,43 @@ export const useWatcherStore = defineStore('watcher', () => {
     },
     { deep: true },
   )
+
   watch(
     settings,
     () => {
       persistSettings()
     },
     { deep: true },
+  )
+
+  watch(
+    () => settings.value.refreshCron,
+    () => {
+      if (pollingEnabled.value) {
+        scheduleNextAutoRefresh()
+      }
+    },
+  )
+
+  watch(
+    () => settings.value.chartSegmentMinutes,
+    () => {
+      resegmentAllHistories()
+    },
+  )
+
+  watch(
+    () => settings.value.historyStorageLimit,
+    () => {
+      for (const address of servers.value) {
+        const runtime = runtimes[address]
+        if (!runtime) {
+          continue
+        }
+        runtime.history = normalizeHistory(runtime.history, settings.value.historyStorageLimit)
+      }
+      persistHistory()
+    },
   )
 
   hydrate()
@@ -371,11 +559,13 @@ export const useWatcherStore = defineStore('watcher', () => {
     serverRows,
     isRefreshing,
     lastRefreshAt,
+    nextRefreshAt,
     initializedGlobal,
     addServer,
     removeServer,
     refreshAll,
     startPolling,
     stopPolling,
+    updateSettings,
   }
 })

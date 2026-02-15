@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, reactive, watch } from 'vue'
+import { computed, reactive, ref, watch } from 'vue'
 import Dialog from 'primevue/dialog'
 import Button from 'primevue/button'
 import InputText from 'primevue/inputtext'
@@ -7,6 +7,7 @@ import InputNumber from 'primevue/inputnumber'
 import ToggleSwitch from 'primevue/toggleswitch'
 import MultiSelect from 'primevue/multiselect'
 import type { AlertSettings, PlayerRuleItem } from '@/services/alertEngine'
+import { validateCronExpression } from '@/utils/cron'
 
 const props = defineProps<{
   modelValue: boolean
@@ -26,10 +27,17 @@ const local = reactive<AlertSettings>({
   countAlertEnabled: false,
   countAlertMode: 'any_increase',
   countThreshold: 5,
-  chartHours: 12,
+  chartSegmentMinutes: 10,
+  chartVisibleSegments: 35,
+  historyStorageLimit: 1000,
+  curveColorMode: 'latest_state',
+  showStatusTrack: true,
+  refreshCron: '*/10 * * * *',
   soundEnabled: true,
   systemNotifyEnabled: true,
 })
+
+const cronError = ref('')
 
 const visible = computed({
   get: () => props.modelValue,
@@ -40,9 +48,11 @@ watch(
   () => props.modelValue,
   (isOpen) => {
     if (!isOpen) {
+      cronError.value = ''
       return
     }
     Object.assign(local, cloneSettings(props.settings))
+    cronError.value = ''
   },
   { immediate: true },
 )
@@ -67,7 +77,12 @@ function cloneSettings(input: AlertSettings): AlertSettings {
     countAlertEnabled: input.countAlertEnabled,
     countAlertMode: input.countAlertMode,
     countThreshold: input.countThreshold,
-    chartHours: input.chartHours,
+    chartSegmentMinutes: input.chartSegmentMinutes,
+    chartVisibleSegments: input.chartVisibleSegments,
+    historyStorageLimit: input.historyStorageLimit,
+    curveColorMode: input.curveColorMode,
+    showStatusTrack: input.showStatusTrack,
+    refreshCron: input.refreshCron,
     soundEnabled: input.soundEnabled,
     systemNotifyEnabled: input.systemNotifyEnabled,
   }
@@ -93,12 +108,22 @@ function onScopeModeChange(rule: PlayerRuleItem, mode: 'global' | 'servers') {
 }
 
 function save() {
+  const cronValidation = validateCronExpression(local.refreshCron)
+  if (!cronValidation.valid) {
+    cronError.value = cronValidation.error
+    return
+  }
+  cronError.value = ''
+
   const payload: AlertSettings = {
     ...cloneSettings(local),
     whitelist: normalizeRules(local.whitelist),
     blacklist: normalizeRules(local.blacklist),
     countThreshold: Math.max(1, Math.floor(local.countThreshold || 1)),
-    chartHours: Math.min(168, Math.max(1, Math.floor(local.chartHours || 12))),
+    chartSegmentMinutes: Math.max(1, Math.floor(local.chartSegmentMinutes || 10)),
+    chartVisibleSegments: Math.max(1, Math.min(35, Math.floor(local.chartVisibleSegments || 35))),
+    historyStorageLimit: Math.max(50, Math.floor(local.historyStorageLimit || 1000)),
+    refreshCron: local.refreshCron.trim(),
   }
   emit('save', payload)
   visible.value = false
@@ -128,8 +153,37 @@ function normalizeRules(input: PlayerRuleItem[]) {
 </script>
 
 <template>
-  <Dialog v-model:visible="visible" modal header="设置" :style="{ width: 'min(960px, 92vw)' }">
+  <Dialog v-model:visible="visible" modal header="设置" :style="{ width: 'min(980px, 94vw)' }">
     <section class="settings-grid">
+      <div class="item">
+        <label>刷新 Cron（5段）</label>
+        <InputText v-model="local.refreshCron" placeholder="*/10 * * * *" />
+        <small class="hint">格式：min hour dom mon dow</small>
+        <small v-if="cronError" class="error">{{ cronError }}</small>
+      </div>
+      <div class="item">
+        <label>每段间隔（分钟）</label>
+        <InputNumber v-model="local.chartSegmentMinutes" :min="1" />
+      </div>
+      <div class="item">
+        <label>展示段数（最多35）</label>
+        <InputNumber v-model="local.chartVisibleSegments" :min="1" :max="35" />
+      </div>
+      <div class="item">
+        <label>每服最多存储条数</label>
+        <InputNumber v-model="local.historyStorageLimit" :min="50" />
+      </div>
+      <div class="item">
+        <label>曲线着色模式</label>
+        <select v-model="local.curveColorMode" class="plain-select">
+          <option value="latest_state">整条按当前状态</option>
+          <option value="per_segment">分段按历史状态</option>
+        </select>
+      </div>
+      <div class="item">
+        <label>显示状态条</label>
+        <ToggleSwitch v-model="local.showStatusTrack" />
+      </div>
       <div class="item">
         <label>白名单模式</label>
         <ToggleSwitch v-model="local.whitelistMode" />
@@ -147,10 +201,6 @@ function normalizeRules(input: PlayerRuleItem[]) {
         <ToggleSwitch v-model="local.systemNotifyEnabled" />
       </div>
       <div class="item">
-        <label>历史曲线时长（小时）</label>
-        <InputNumber v-model="local.chartHours" :min="1" :max="168" />
-      </div>
-      <div class="item">
         <label>人数提醒模式</label>
         <select v-model="local.countAlertMode" class="plain-select">
           <option value="any_increase">任意增加</option>
@@ -159,7 +209,11 @@ function normalizeRules(input: PlayerRuleItem[]) {
       </div>
       <div class="item">
         <label>人数提醒阈值</label>
-        <InputNumber v-model="local.countThreshold" :min="1" :disabled="local.countAlertMode !== 'threshold'" />
+        <InputNumber
+          v-model="local.countThreshold"
+          :min="1"
+          :disabled="local.countAlertMode !== 'threshold'"
+        />
       </div>
     </section>
 
@@ -171,7 +225,16 @@ function normalizeRules(input: PlayerRuleItem[]) {
       <div v-if="!local.whitelist.length" class="empty">暂无白名单条目</div>
       <div v-for="(rule, index) in local.whitelist" :key="`w-${index}`" class="rule-row">
         <InputText v-model="rule.playerId" placeholder="玩家ID" />
-        <select :value="rule.scope.mode" class="plain-select" @change="onScopeModeChange(rule, ($event.target as HTMLSelectElement).value as 'global' | 'servers')">
+        <select
+          :value="rule.scope.mode"
+          class="plain-select"
+          @change="
+            onScopeModeChange(
+              rule,
+              ($event.target as HTMLSelectElement).value as 'global' | 'servers',
+            )
+          "
+        >
           <option value="global">全局</option>
           <option value="servers">指定服务器</option>
         </select>
@@ -183,7 +246,12 @@ function normalizeRules(input: PlayerRuleItem[]) {
           display="chip"
           filter
         />
-        <Button severity="danger" size="small" label="删除" @click="removeRule(local.whitelist, index)" />
+        <Button
+          severity="danger"
+          size="small"
+          label="删除"
+          @click="removeRule(local.whitelist, index)"
+        />
       </div>
     </section>
 
@@ -195,7 +263,16 @@ function normalizeRules(input: PlayerRuleItem[]) {
       <div v-if="!local.blacklist.length" class="empty">暂无黑名单条目</div>
       <div v-for="(rule, index) in local.blacklist" :key="`b-${index}`" class="rule-row">
         <InputText v-model="rule.playerId" placeholder="玩家ID" />
-        <select :value="rule.scope.mode" class="plain-select" @change="onScopeModeChange(rule, ($event.target as HTMLSelectElement).value as 'global' | 'servers')">
+        <select
+          :value="rule.scope.mode"
+          class="plain-select"
+          @change="
+            onScopeModeChange(
+              rule,
+              ($event.target as HTMLSelectElement).value as 'global' | 'servers',
+            )
+          "
+        >
           <option value="global">全局</option>
           <option value="servers">指定服务器</option>
         </select>
@@ -207,7 +284,12 @@ function normalizeRules(input: PlayerRuleItem[]) {
           display="chip"
           filter
         />
-        <Button severity="danger" size="small" label="删除" @click="removeRule(local.blacklist, index)" />
+        <Button
+          severity="danger"
+          size="small"
+          label="删除"
+          @click="removeRule(local.blacklist, index)"
+        />
       </div>
     </section>
 
@@ -230,6 +312,16 @@ function normalizeRules(input: PlayerRuleItem[]) {
   display: flex;
   flex-direction: column;
   gap: 0.4rem;
+}
+
+.hint {
+  color: #94a3b8;
+  font-size: 12px;
+}
+
+.error {
+  color: #fca5a5;
+  font-size: 12px;
 }
 
 .rules-block {

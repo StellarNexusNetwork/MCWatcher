@@ -8,6 +8,7 @@ export type PlayerRuleItem = {
 }
 
 export type CountAlertMode = 'any_increase' | 'threshold'
+export type CurveColorMode = 'latest_state' | 'per_segment'
 
 export type AlertSettings = {
   whitelistMode: boolean
@@ -16,7 +17,12 @@ export type AlertSettings = {
   countAlertEnabled: boolean
   countAlertMode: CountAlertMode
   countThreshold: number
-  chartHours: number
+  chartSegmentMinutes: number
+  chartVisibleSegments: number
+  historyStorageLimit: number
+  curveColorMode: CurveColorMode
+  showStatusTrack: boolean
+  refreshCron: string
   soundEnabled: boolean
   systemNotifyEnabled: boolean
 }

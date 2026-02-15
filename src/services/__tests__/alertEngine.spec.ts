@@ -8,7 +8,12 @@ const baseSettings: AlertSettings = {
   countAlertEnabled: false,
   countAlertMode: 'any_increase',
   countThreshold: 3,
-  chartHours: 12,
+  chartSegmentMinutes: 10,
+  chartVisibleSegments: 35,
+  historyStorageLimit: 1000,
+  curveColorMode: 'latest_state',
+  showStatusTrack: true,
+  refreshCron: '*/10 * * * *',
   soundEnabled: true,
   systemNotifyEnabled: true,
 }

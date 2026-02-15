@@ -10,8 +10,25 @@ import type { AlertSettings } from '@/services/alertEngine'
 const store = useWatcherStore()
 const serverInput = ref('')
 const showSettings = ref(false)
+const nowTs = ref(Date.now())
+let countdownTimer: ReturnType<typeof setInterval> | null = null
 
 const rows = computed(() => store.serverRows)
+const countdownText = computed(() => {
+  if (store.nextRefreshAt === null) {
+    return '--:--:--'
+  }
+  const remainMs = Math.max(0, store.nextRefreshAt - nowTs.value)
+  const totalSeconds = Math.floor(remainMs / 1000)
+  const hours = Math.floor(totalSeconds / 3600)
+  const minutes = Math.floor((totalSeconds % 3600) / 60)
+  const seconds = totalSeconds % 60
+  return `${pad2(hours)}:${pad2(minutes)}:${pad2(seconds)}`
+})
+
+function pad2(value: number) {
+  return value.toString().padStart(2, '0')
+}
 
 function addServer() {
   if (!store.addServer(serverInput.value)) {
@@ -26,14 +43,21 @@ function removeServer(address: string) {
 }
 
 function onSaveSettings(nextSettings: AlertSettings) {
-  store.settings = nextSettings
+  store.updateSettings(nextSettings)
 }
 
 onMounted(() => {
+  countdownTimer = setInterval(() => {
+    nowTs.value = Date.now()
+  }, 1000)
   store.startPolling()
 })
 
 onBeforeUnmount(() => {
+  if (countdownTimer) {
+    clearInterval(countdownTimer)
+    countdownTimer = null
+  }
   store.stopPolling()
 })
 </script>
@@ -43,10 +67,10 @@ onBeforeUnmount(() => {
     <header class="topbar">
       <div>
         <h1>MCWatcher</h1>
-        <p>服务器状态每 10 分钟刷新一次</p>
+        <p>下一次刷新：{{ countdownText }}</p>
       </div>
       <div class="actions">
-        <Button label="立即刷新" :loading="store.isRefreshing" @click="store.refreshAll" />
+        <Button label="手动刷新" :loading="store.isRefreshing" @click="store.refreshAll('manual')" />
         <Button label="设置" severity="secondary" @click="showSettings = true" />
       </div>
     </header>
@@ -70,7 +94,7 @@ onBeforeUnmount(() => {
         <div class="remove-action">
           <Button size="small" severity="danger" label="删除" @click="removeServer(server.address)" />
         </div>
-        <ServerRowCard :server="server" />
+        <ServerRowCard :server="server" :settings="store.settings" />
       </article>
     </section>
 
